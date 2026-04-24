@@ -1,374 +1,275 @@
 #!/usr/bin/env python3
 """
-FREELANCE HUNTER v3 — реальні джерела що працюють
+FREELANCE HUNTER v6
+Claude сам вирішує що виконувати — без жорстких фільтрів.
+Скидає тільки те що може зробити за 1-2 промпти.
 """
-import asyncio
-import aiohttp
-import hashlib
-import re
-import logging
-import json
-import os
+import asyncio, aiohttp, hashlib, re, logging, json, os
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Optional
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputFile
-from telegram.ext import (
-    Application, CommandHandler, CallbackQueryHandler,
-    MessageHandler, filters, ContextTypes
-)
-from telegram.constants import ParseMode
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters
 import anthropic
 
-logging.basicConfig(
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    level=logging.INFO, datefmt="%H:%M:%S"
-)
-log = logging.getLogger("hunter")
+logging.basicConfig(format="%(asctime)s %(levelname)s %(message)s", level=logging.INFO, datefmt="%H:%M:%S")
+log = logging.getLogger("bot")
 
-TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-ANTHROPIC_API_KEY  = os.environ.get("ANTHROPIC_API_KEY", "")
-ALLOWED_USER_ID    = int(os.environ.get("ALLOWED_USER_ID", "0"))
+TOKEN   = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
+UID     = int(os.environ.get("ALLOWED_USER_ID", "0"))
 
-# ── Що Claude може зробити ────────────────────────────────────
-CAN_DO = [
-    "telegram", "discord", "chatbot", "chat bot", "bot",
-    "python", "script", "automat",
-    "chatgpt", "openai", "claude", "gpt", "llm", "ai",
-    "content", "copywrite", "blog", "article", "writ",
-    "product description", "social media", "instagram",
-    "scraping", "scraper", "crawl", "data extract",
-    "google sheets", "excel", "spreadsheet",
-    "resume", "cover letter", "proofread", "rewrite", "edit",
-    "translat",
-    "data entry", "data process",
-    "landing page", "html", "simple web",
-    "email", "newsletter",
-    "summarize", "summary", "report",
-    "virtual assistant", "api", "webhook", "zapier", "make.com",
-    "prompt", "gpt wrapper", "openai api",
-]
 
-CANT_DO = [
-    "mobile app", "ios", "android", "flutter", "react native", "swift", "kotlin",
-    "blockchain", "smart contract", "solidity", "web3", "nft", "crypto",
-    "machine learning", "train model", "deep learning", "neural network",
-    "3d", "unity", "unreal", "game dev", "blender",
-    "video edit", "motion graphic", "after effects", "premiere",
-    "logo", "graphic design", "illustrator", "photoshop",
-    "wordpress plugin", "shopify app", "magento",
-    "pen test", "cybersecurity", "exploit",
-]
+def clean(text: str) -> str:
+    text = re.sub(r'<[^>]+>', ' ', text)
+    text = re.sub(r'please mention the word.*', '', text, flags=re.I | re.DOTALL)
+    text = re.sub(r'tag [A-Za-z0-9+/=]{10,}', '', text)
+    text = re.sub(r'#[A-Za-z0-9]{15,}', '', text)
+    text = re.sub(r'\s+', ' ', text)
+    return text.strip()[:700]
+
+
+def get_budget(text: str) -> str:
+    for p in [r'\$[\d,]+\s*[-–]\s*\$[\d,]+', r'\$[\d,]+\+?', r'£[\d,]+', r'€[\d,]+']:
+        m = re.search(p, text, re.I)
+        if m:
+            return m.group(0).strip()
+    return "не вказано"
 
 
 @dataclass
-class Job:
+class Task:
     title: str
-    description: str
+    desc: str
     url: str
     source: str
-    budget: str = "Not specified"
+    budget: str = "не вказано"
     uid: str = ""
-    found_at: datetime = field(default_factory=datetime.now)
-    what: str = ""
-    how: str = ""
-    complexity: str = "MEDIUM"
-    minutes: int = 60
-    price: int = 50
-    can_auto: bool = True
+    # Після Claude аналізу
+    title_ua: str = ""
+    what_ua: str = ""
+    how_ua: str = ""
+    time_ua: str = ""
+    price: int = 0
     reply_en: str = ""
     result: str = ""
     filename: str = "result.txt"
-    _file_path: str = ""
+    file_path: str = ""
 
     def __post_init__(self):
         self.uid = hashlib.md5((self.url + self.title).encode()).hexdigest()[:10]
-        self.description = re.sub(r'<[^>]+>', ' ', self.description)
-        self.description = re.sub(r'\s+', ' ', self.description).strip()[:800]
+        self.desc = clean(self.desc)
 
 
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-#  СКАНЕР — тільки відкриті API що реально працюють
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# СКАНЕР — збирає ВСЕ, Claude потім відбирає
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
 class Scanner:
     def __init__(self):
         self.seen: set = set()
-        self._session: Optional[aiohttp.ClientSession] = None
+        self._sess = None
 
-    async def _get(self, url: str, headers: dict = None) -> Optional[dict]:
+    async def _get(self, url: str, as_text=False):
         try:
-            if not self._session or self._session.closed:
-                self._session = aiohttp.ClientSession()
-            h = {"User-Agent": "Mozilla/5.0", "Accept": "application/json"}
-            if headers:
-                h.update(headers)
-            async with self._session.get(
-                url, headers=h, timeout=aiohttp.ClientTimeout(total=15)
-            ) as r:
+            if not self._sess or self._sess.closed:
+                self._sess = aiohttp.ClientSession(headers={
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+                    "Accept": "application/json, text/xml, */*",
+                })
+            async with self._sess.get(url, timeout=aiohttp.ClientTimeout(total=15)) as r:
                 if r.status == 200:
-                    ct = r.headers.get("content-type", "")
-                    if "json" in ct:
-                        return await r.json()
-                    text = await r.text()
+                    if as_text:
+                        return await r.text()
                     try:
-                        return json.loads(text)
+                        return await r.json(content_type=None)
                     except:
-                        return {"_raw": text}
-                log.debug(f"HTTP {r.status}: {url[:60]}")
+                        return await r.text()
         except Exception as e:
-            log.debug(f"fetch error {url[:60]}: {e}")
+            log.debug(f"fetch: {e}")
         return None
 
-    def _ok(self, title: str, desc: str) -> bool:
-        text = (title + " " + desc).lower()
-        for kw in CANT_DO:
-            if kw in text:
-                return False
-        for kw in CAN_DO:
-            if kw in text:
-                return True
-        return False
-
-    def _budget(self, text: str) -> str:
-        for p in [r'\$[\d,]+\s*[-–k]+\s*\$?[\d,k]+', r'\$[\d,k]+\+?', r'£[\d,]+', r'€[\d,]+']:
-            m = re.search(p, text, re.I)
-            if m:
-                return m.group(0).strip()
-        return "Not specified"
-
-    # ── 1. RemoteOK — найбільша база remote jobs ──────────────
-    async def _remoteok(self) -> list[Job]:
-        data = await self._get("https://remoteok.com/api", {"Accept": "application/json"})
-        jobs = []
-        if not isinstance(data, list):
-            return jobs
-        for item in data[1:40]:  # перший елемент — legal notice
-            if not isinstance(item, dict):
-                continue
-            title = item.get("position", "")
-            desc  = item.get("description", "")
-            url   = item.get("url", "")
-            if not title or not url:
-                continue
-            tags = " ".join(item.get("tags", []))
-            salary = item.get("salary", "") or ""
-            budget = self._budget(str(salary)) if salary else "Not specified"
-            if self._ok(title, desc + " " + tags):
-                jobs.append(Job(
-                    title=title, description=desc[:600],
-                    url=url, source="RemoteOK",
-                    budget=budget,
-                ))
-        log.info(f"RemoteOK: {len(jobs)} підходящих")
-        return jobs
-
-    # ── 2. Arbeitnow — безкоштовне API без ключа ─────────────
-    async def _arbeitnow(self) -> list[Job]:
-        data = await self._get("https://www.arbeitnow.com/api/job-board-api")
-        jobs = []
-        if not isinstance(data, dict):
-            return jobs
-        for item in data.get("data", [])[:30]:
-            title = item.get("title", "")
-            desc  = item.get("description", "")
-            url   = item.get("url", "")
-            if not title or not url:
-                continue
-            if self._ok(title, desc):
-                jobs.append(Job(
-                    title=title, description=desc[:600],
-                    url=url, source="Arbeitnow",
-                ))
-        log.info(f"Arbeitnow: {len(jobs)} підходящих")
-        return jobs
-
-    # ── 3. Himalayas — tech jobs API ──────────────────────────
-    async def _himalayas(self) -> list[Job]:
-        urls = [
-            "https://himalayas.app/jobs/api?q=chatgpt&limit=20",
-            "https://himalayas.app/jobs/api?q=telegram+bot&limit=20",
-            "https://himalayas.app/jobs/api?q=python+automation&limit=20",
-            "https://himalayas.app/jobs/api?q=ai+assistant&limit=20",
+    async def _freelancer(self) -> list[Task]:
+        """Freelancer API — всі свіжі проекти без фільтрів"""
+        queries = [
+            "chatgpt", "telegram bot", "python script",
+            "content writing", "blog article", "copywriting",
+            "web scraping", "data entry", "translation",
+            "resume", "proofreading", "ai assistant",
+            "automation", "google sheets", "email writing",
+            "social media", "product description", "chatbot",
+            "landing page", "html", "summarize", "research",
         ]
-        jobs = []
-        for url in urls:
-            data = await self._get(url)
-            if not isinstance(data, dict):
-                await asyncio.sleep(1)
-                continue
-            for item in data.get("jobs", []):
-                title = item.get("title", "")
-                desc  = item.get("description", "")
-                url2  = item.get("applicationLink", item.get("url", ""))
-                if not title or not url2:
-                    continue
-                salary = item.get("salary", "") or ""
-                if self._ok(title, desc):
-                    jobs.append(Job(
-                        title=title, description=desc[:600],
-                        url=url2, source="Himalayas",
-                        budget=str(salary) if salary else "Not specified",
-                    ))
-            await asyncio.sleep(1)
-        log.info(f"Himalayas: {len(jobs)} підходящих")
-        return jobs
-
-    # ── 4. FindWork — dev jobs ────────────────────────────────
-    async def _findwork(self) -> list[Job]:
-        searches = ["chatgpt", "telegram bot", "python script", "automation"]
-        jobs = []
-        for q in searches:
-            data = await self._get(f"https://findwork.dev/api/jobs/?search={q}&remote=true")
-            if not isinstance(data, dict):
-                await asyncio.sleep(1)
-                continue
-            for item in data.get("results", [])[:10]:
-                title = item.get("role", "")
-                desc  = item.get("text", "")
-                url   = item.get("url", "")
-                if not title or not url:
-                    continue
-                if self._ok(title, desc):
-                    jobs.append(Job(
-                        title=title, description=desc[:600],
-                        url=url, source="FindWork",
-                    ))
-            await asyncio.sleep(1)
-        log.info(f"FindWork: {len(jobs)} підходящих")
-        return jobs
-
-    # ── 5. JobIceCream — remote jobs ─────────────────────────
-    async def _jobicecream(self) -> list[Job]:
-        data = await self._get("https://jobicecream.com/api/jobs?category=software-dev&remote=true")
-        jobs = []
-        if not isinstance(data, dict):
-            return jobs
-        for item in data.get("jobs", data.get("data", []))[:30]:
-            title = item.get("title", item.get("position", ""))
-            desc  = item.get("description", item.get("body", ""))
-            url   = item.get("url", item.get("link", ""))
-            if not title or not url:
-                continue
-            if self._ok(title, desc):
-                jobs.append(Job(
-                    title=title, description=str(desc)[:600],
-                    url=url, source="JobIceCream",
-                ))
-        log.info(f"JobIceCream: {len(jobs)} підходящих")
-        return jobs
-
-    # ── 6. We Work Remotely RSS (реально працює) ─────────────
-    async def _weworkremotely(self) -> list[Job]:
-        import feedparser
-        feeds = [
-            "https://weworkremotely.com/categories/remote-programming-jobs.rss",
-            "https://weworkremotely.com/categories/remote-copywriting-jobs.rss",
-            "https://weworkremotely.com/remote-jobs.rss",
-        ]
-        jobs = []
-        for feed_url in feeds:
-            try:
-                if not self._session or self._session.closed:
-                    self._session = aiohttp.ClientSession()
-                async with self._session.get(
-                    feed_url,
-                    headers={"User-Agent": "Mozilla/5.0"},
-                    timeout=aiohttp.ClientTimeout(total=12)
-                ) as r:
-                    if r.status != 200:
-                        continue
-                    text = await r.text()
-                feed = feedparser.parse(text)
-                for e in feed.entries[:15]:
-                    title = e.get("title", "")
-                    desc  = e.get("summary", "")
-                    url   = e.get("link", "")
-                    if not title or not url:
-                        continue
-                    if self._ok(title, desc):
-                        jobs.append(Job(
-                            title=title,
-                            description=re.sub(r'<[^>]+>', ' ', desc)[:600],
-                            url=url, source="WeWorkRemotely",
-                        ))
-            except Exception as ex:
-                log.debug(f"WWR feed error: {ex}")
-            await asyncio.sleep(1)
-        log.info(f"WeWorkRemotely: {len(jobs)} підходящих")
-        return jobs
-
-    # ── 7. Freelancer публічне API (без ключа, обмежено) ─────
-    async def _freelancer_api(self) -> list[Job]:
-        queries = ["telegram bot", "chatgpt automation", "python script", "content writing ai"]
-        jobs = []
+        tasks = []
         for q in queries:
             data = await self._get(
                 f"https://www.freelancer.com/api/projects/0.1/projects/active/"
-                f"?query={q.replace(' ', '+')}&limit=10&job_details=true"
+                f"?query={q.replace(' ', '+')}&limit=20&job_details=true"
             )
-            if not isinstance(data, dict):
-                await asyncio.sleep(2)
-                continue
-            result = data.get("result", {})
-            projects = result.get("projects", []) if isinstance(result, dict) else []
-            for item in projects:
-                title = item.get("title", "")
-                desc  = item.get("preview_description", "")
-                pid   = item.get("id", "")
-                url   = f"https://www.freelancer.com/projects/{pid}" if pid else ""
-                budget = item.get("budget", {})
-                bmin  = budget.get("minimum", "") if isinstance(budget, dict) else ""
-                bmax  = budget.get("maximum", "") if isinstance(budget, dict) else ""
-                bstr  = f"${bmin}-${bmax}" if bmin and bmax else "Not specified"
-                if not title or not url:
-                    continue
-                if self._ok(title, desc):
-                    jobs.append(Job(
-                        title=title, description=desc[:600],
-                        url=url, source="Freelancer",
-                        budget=bstr,
+            if isinstance(data, dict):
+                for p in data.get("result", {}).get("projects", []):
+                    title = p.get("title", "").strip()
+                    desc  = p.get("preview_description", "").strip()
+                    pid   = p.get("id")
+                    if not title or not pid:
+                        continue
+                    b = p.get("budget", {})
+                    bmin = int(b.get("minimum", 0) or 0)
+                    bmax = int(b.get("maximum", 0) or 0)
+                    bstr = f"${bmin}-${bmax}" if bmin else "не вказано"
+                    tasks.append(Task(
+                        title=title, desc=desc,
+                        url=f"https://www.freelancer.com/projects/{pid}",
+                        source="Freelancer", budget=bstr,
                     ))
-            await asyncio.sleep(2)
-        log.info(f"Freelancer API: {len(jobs)} підходящих")
-        return jobs
+            await asyncio.sleep(1)
+        log.info(f"Freelancer: {len(tasks)} зібрано")
+        return tasks
 
-    # ── Головний скан ─────────────────────────────────────────
-    async def scan(self) -> list[Job]:
-        all_jobs: list[Job] = []
-
-        sources = [
-            self._remoteok(),
-            self._weworkremotely(),
-            self._freelancer_api(),
-            self._arbeitnow(),
-            self._himalayas(),
-            self._findwork(),
+    async def _guru(self) -> list[Task]:
+        import feedparser
+        queries = [
+            "chatgpt", "telegram bot", "python script",
+            "content writing", "blog", "translation",
+            "resume", "data entry", "automation",
+            "copywriting", "web scraping", "ai",
         ]
+        tasks = []
+        for q in queries:
+            text = await self._get(
+                f"https://www.guru.com/jobs/search/index.aspx?output=rss&keyword={q.replace(' ', '+')}",
+                as_text=True
+            )
+            if not text:
+                continue
+            for e in feedparser.parse(text).entries[:10]:
+                title = e.get("title", "").strip()
+                desc  = e.get("summary", "").strip()
+                url   = e.get("link", "")
+                if title and url:
+                    tasks.append(Task(
+                        title=title, desc=desc, url=url,
+                        source="Guru",
+                        budget=get_budget(title + " " + desc),
+                    ))
+            await asyncio.sleep(0.8)
+        log.info(f"Guru: {len(tasks)} зібрано")
+        return tasks
 
-        results = await asyncio.gather(*sources, return_exceptions=True)
+    async def _pph(self) -> list[Task]:
+        import feedparser
+        queries = [
+            "chatgpt", "telegram bot", "python",
+            "content writing", "blog", "translation",
+            "resume", "copywriting", "automation",
+        ]
+        tasks = []
+        for q in queries:
+            text = await self._get(
+                f"https://www.peopleperhour.com/rss/jobs?q={q.replace(' ', '+')}",
+                as_text=True
+            )
+            if not text:
+                continue
+            for e in feedparser.parse(text).entries[:10]:
+                title = e.get("title", "").strip()
+                desc  = e.get("summary", "").strip()
+                url   = e.get("link", "")
+                if title and url:
+                    tasks.append(Task(
+                        title=title, desc=desc, url=url,
+                        source="PeoplePerHour",
+                        budget=get_budget(title + " " + desc),
+                    ))
+            await asyncio.sleep(0.8)
+        log.info(f"PeoplePerHour: {len(tasks)} зібрано")
+        return tasks
+
+    async def scan(self) -> list[Task]:
+        results = await asyncio.gather(
+            self._freelancer(), self._guru(), self._pph(),
+            return_exceptions=True
+        )
+        all_tasks = []
         for r in results:
             if isinstance(r, list):
-                all_jobs.extend(r)
+                all_tasks.extend(r)
 
-        # Фільтруємо тільки нові
-        new_jobs = []
-        for j in all_jobs:
-            if j.uid not in self.seen:
-                self.seen.add(j.uid)
-                new_jobs.append(j)
-
-        log.info(f"Всього нових підходящих: {len(new_jobs)}")
-        return new_jobs
+        # Тільки нові (не показані раніше)
+        new = [t for t in all_tasks if t.uid not in self.seen]
+        for t in new:
+            self.seen.add(t.uid)
+        log.info(f"Нових: {len(new)} з {len(all_tasks)}")
+        return new
 
 
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-#  ВИКОНАВЕЦЬ
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# CLAUDE — аналізує і вирішує сам
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+JUDGE_PROMPT = """Ти AI фріланс агент. Проаналізуй це завдання з фріланс платформи.
+
+ЗАВДАННЯ:
+Назва: {title}
+Опис: {desc}
+Бюджет: {budget}
+Платформа: {source}
+
+ТВОЄ ЗАВДАННЯ — вирішити чи можна виконати це за 1-2 промпти в Claude AI.
+
+Приклади що МОЖНА виконати:
+- Написати статтю/пост/опис
+- Зробити переклад тексту
+- Написати резюме або cover letter
+- Написати Python скрипт для автоматизації
+- Зробити Telegram/Discord бота
+- Зробити веб-скрапер
+- Переписати/відредагувати текст
+- Зробити email послідовність
+- Написати контент для соцмереж
+- Зробити просту HTML сторінку
+- Проаналізувати дані і написати звіт
+
+Приклади що НЕ МОЖНА (вакансія або занадто складне):
+- Повноцінна робота на ставці (salary, full-time, senior position)
+- Мобільний додаток з нуля
+- Складна ML модель
+- Дизайн логотипу/бренду
+- Відеомонтаж
+
+Відповідай ТІЛЬКИ JSON без markdown:
+{{
+  "can_do": true або false,
+  "reason": "чому можна або не можна (1 речення)",
+  "title_ua": "Назва завдання українською",
+  "what_ua": "Що конкретно зробимо (1 речення)",
+  "how_ua": "Як виконаємо через Claude (1 речення)",
+  "time_ua": "30 хв або 1 год або 2 год",
+  "price": 50,
+  "reply_en": "Готова відповідь клієнту англійською. 2-3 речення. Природньо. Назви ціну і термін.",
+  "filename": "result.txt або result.py або result.md"
+}}"""
+
+EXECUTE_PROMPT = """Ти топовий AI фріланс виконавець. Виконай завдання ПОВНІСТЮ і якісно.
+
+НАЗВА: {title}
+ДЕТАЛІ: {desc}
+
+ПРАВИЛА:
+- Виконай повністю — клієнт отримає готовий результат
+- Якщо код — повний робочий код з коментарями
+- Якщо текст — повний готовий текст
+- Якщо переклад — повний переклад
+- Якщо бракує деталей — прийми найкраще рішення самостійно
+- НЕ пиши "зверніться до мене" або "уточніть деталі"
+- Результат має бути готовий до відправки БЕЗ змін"""
+
+
 class Executor:
-    def __init__(self, api_key: str):
-        self.claude = anthropic.Anthropic(api_key=api_key)
+    def __init__(self):
+        self.claude = anthropic.Anthropic(api_key=API_KEY)
 
-    def _ask(self, prompt: str, max_tokens=2000) -> str:
+    def _ask(self, prompt: str, max_tokens=3000) -> str:
         try:
             r = self.claude.messages.create(
                 model="claude-opus-4-5",
@@ -377,143 +278,127 @@ class Executor:
             )
             return r.content[0].text.strip()
         except Exception as e:
-            log.error(f"claude: {e}")
+            log.error(f"Claude: {e}")
             return ""
 
-    def analyze(self, job: Job) -> Job:
+    def judge(self, task: Task) -> Optional[Task]:
+        """Claude сам вирішує чи виконувати"""
         raw = self._ask(
-            f"""You are an AI freelance executor. Analyze this job. Reply ONLY with JSON, no markdown.
-
-Title: {job.title}
-Description: {job.description[:400]}
-Budget: {job.budget}
-
-JSON:
-{{
-  "what": "What is needed (3-5 words in Ukrainian)",
-  "how": "How we will do it (3-5 words in Ukrainian)",
-  "complexity": "SIMPLE or MEDIUM or COMPLEX",
-  "minutes": 45,
-  "price": 60,
-  "can_auto": true,
-  "reply_en": "Full professional reply to client in English. Say you're an AI specialist, can deliver, mention price and timeline. 3-4 natural sentences.",
-  "filename": "result.py or result.txt or result.md"
-}}
-
-can_auto=true if this is text/content/script/resume/translation Claude can do without client's private data.""",
+            JUDGE_PROMPT.format(
+                title=task.title,
+                desc=task.desc[:500],
+                budget=task.budget,
+                source=task.source,
+            ),
             max_tokens=600,
         )
         try:
             m = re.search(r'\{.*\}', raw, re.DOTALL)
-            if m:
-                d = json.loads(m.group(0))
-                job.what      = d.get("what", job.title[:40])
-                job.how       = d.get("how", "Claude AI")
-                job.complexity = d.get("complexity", "MEDIUM")
-                job.minutes   = int(d.get("minutes", 60))
-                job.price     = int(d.get("price", 50))
-                job.can_auto  = bool(d.get("can_auto", True))
-                job.reply_en  = d.get("reply_en", "Hi! I can help with this project.")
-                job.filename  = d.get("filename", "result.txt")
+            if not m:
+                return None
+            d = json.loads(m.group(0))
+
+            if not d.get("can_do", False):
+                log.info(f"SKIP: {task.title[:50]} | {d.get('reason', '')}")
+                return None
+
+            task.title_ua = d.get("title_ua", task.title[:60])
+            task.what_ua  = d.get("what_ua", "")
+            task.how_ua   = d.get("how_ua", "")
+            task.time_ua  = d.get("time_ua", "1-2 год")
+            task.price    = int(d.get("price", 50))
+            task.reply_en = d.get("reply_en", "Hi! I can help with this.")
+            task.filename = d.get("filename", "result.txt")
+            log.info(f"OK: {task.title_ua}")
+            return task
         except Exception as e:
-            log.error(f"analyze parse: {e}")
-        return job
+            log.error(f"judge parse: {e}")
+            return None
 
-    def execute(self, job: Job) -> Job:
+    def execute(self, task: Task) -> Task:
+        """Claude виконує завдання"""
         result = self._ask(
-            f"""You are a top AI freelance executor. Complete this job FULLY and professionally.
-
-Title: {job.title}
-Description: {job.description}
-
-RULES:
-- Complete it fully, not partially
-- If code — write complete working code with comments
-- If text/content — write the complete final text
-- If missing details — make the best version yourself
-- Do NOT ask for clarifications — just execute
-- Result must be ready to send to client WITHOUT changes""",
+            EXECUTE_PROMPT.format(title=task.title, desc=task.desc),
             max_tokens=3000,
         )
-        job.result = result
-        safe = re.sub(r'[^\w\-.]', '_', job.filename)
-        path = f"/tmp/{job.uid}_{safe}"
-        with open(path, "w", encoding="utf-8") as f:
-            f.write(result)
-        job._file_path = path
-        return job
+        task.result = result
+        safe = re.sub(r'[^\w\-.]', '_', task.filename)
+        path = f"/tmp/{task.uid}_{safe}"
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(result)
+            task.file_path = path
+        except Exception as e:
+            log.error(f"save file: {e}")
+        return task
 
-    def run(self, job: Job) -> Job:
-        job = self.analyze(job)
-        if job.can_auto:
-            job = self.execute(job)
-        return job
-
-
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-#  TELEGRAM БОТ
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-_jobs: dict[str, Job] = {}
+    def process(self, task: Task) -> Optional[Task]:
+        task = self.judge(task)
+        if not task:
+            return None
+        return self.execute(task)
 
 
-def _card(j: Job) -> str:
-    t = f"{j.minutes} хв" if j.minutes < 60 else f"{j.minutes//60}г {j.minutes%60}хв"
-    d = "Бот виконає сам" if j.can_auto else "Потрібна твоя участь"
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# TELEGRAM БОТ
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+DB: dict[str, Task] = {}
+
+
+def card(t: Task) -> str:
     return (
-        f"НОВЕ ЗАМОВЛЕННЯ\n\n"
-        f"Платформа: {j.source}\n\n"
-        f"{j.title[:100]}\n\n"
-        f"Що: {j.what}\n"
-        f"Як: {j.how}\n\n"
-        f"Складність: {j.complexity}\n"
-        f"Час: {t}\n"
-        f"Бюджет: {j.budget}\n"
-        f"Твоя ціна: ${j.price}\n\n"
-        f"Доставка: {d}"
+        f"НОВЕ ЗАВДАННЯ — {t.source}\n\n"
+        f"{t.title_ua}\n\n"
+        f"Що: {t.what_ua}\n"
+        f"Як: {t.how_ua}\n\n"
+        f"Час: {t.time_ua}\n"
+        f"Бюджет: {t.budget}\n"
+        f"Запропонуй: ${t.price}\n\n"
+        f"Файл готовий нижче"
     )
 
 
-def _kb(j: Job) -> InlineKeyboardMarkup:
-    rows = [[
-        InlineKeyboardButton("Відповідь клієнту", callback_data=f"reply:{j.uid}"),
-        InlineKeyboardButton("Деталі", callback_data=f"detail:{j.uid}"),
-    ]]
-    if j.can_auto and j.result:
-        rows.append([InlineKeyboardButton("Готовий файл", callback_data=f"file:{j.uid}")])
-    else:
-        rows.append([InlineKeyboardButton("Промпт для Claude", callback_data=f"prompt:{j.uid}")])
-    rows.append([
-        InlineKeyboardButton("Відкрити", url=j.url),
-        InlineKeyboardButton("Пропустити", callback_data=f"skip:{j.uid}"),
+def kb(t: Task) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("Відповідь клієнту", callback_data=f"r:{t.uid}"),
+            InlineKeyboardButton("Деталі",            callback_data=f"d:{t.uid}"),
+        ],
+        [
+            InlineKeyboardButton("Отримати файл",     callback_data=f"f:{t.uid}"),
+        ],
+        [
+            InlineKeyboardButton("Відкрити",          url=t.url),
+            InlineKeyboardButton("Пропустити",        callback_data=f"s:{t.uid}"),
+        ],
     ])
-    return InlineKeyboardMarkup(rows)
 
 
 class Bot:
     def __init__(self):
         self.scanner  = Scanner()
-        self.executor = Executor(api_key=ANTHROPIC_API_KEY)
+        self.executor = Executor()
         self.paused   = False
         self.scans    = 0
         self.sent     = 0
 
-    def _ok(self, u: Update) -> bool:
-        return ALLOWED_USER_ID == 0 or u.effective_user.id == ALLOWED_USER_ID
+    def _auth(self, u: Update) -> bool:
+        return UID == 0 or u.effective_user.id == UID
 
-    async def _send(self, u: Update, text: str, kb=None):
-        kw = {"parse_mode": ParseMode.MARKDOWN, "disable_web_page_preview": True}
-        if kb:
-            kw["reply_markup"] = kb
-        for chunk in [text[i:i+4000] for i in range(0, len(text), 4000)]:
+    async def _send(self, u: Update, text: str, markup=None):
+        kw = {"disable_web_page_preview": True}
+        if markup:
+            kw["reply_markup"] = markup
+        for chunk in [text[i:i+4096] for i in range(0, len(text), 4096)]:
             await u.effective_message.reply_text(chunk, **kw)
 
-    async def _push(self, app: Application, j: Job):
-        _jobs[j.uid] = j
+    async def _push(self, app: Application, t: Task):
+        DB[t.uid] = t
         try:
             await app.bot.send_message(
-                chat_id=ALLOWED_USER_ID,
-                text=_card(j),
-                reply_markup=_kb(j),
+                chat_id=UID, text=card(t),
+                reply_markup=kb(t),
                 disable_web_page_preview=True,
             )
             self.sent += 1
@@ -521,65 +406,88 @@ class Bot:
             log.error(f"push: {e}")
 
     async def start(self, u: Update, _):
-        if not self._ok(u): return
-        await u.effective_message.reply_text(
-            "FREELANCE HUNTER v3\n\n"
-            "Сканую RemoteOK, WeWorkRemotely, Freelancer API, Arbeitnow, Himalayas, FindWork\n\n"
-            "Кожні 15 хв знаходжу замовлення, виконую через Claude, надсилаю тобі.\n\n"
-            "/scan - шукати зараз\n"
-            "/status - статистика\n"
-            "/pause - зупинити\n"
-            "/resume - відновити"
+        if not self._auth(u): return
+        await self._send(u,
+            "FREELANCE HUNTER v6\n\n"
+            "Збираю ВСІ завдання з Freelancer, Guru, PeoplePerHour.\n"
+            "Claude сам вирішує що може виконати за 1-2 промпти.\n"
+            "Виконує і надсилає готовий файл.\n\n"
+            "Твоя участь:\n"
+            "1. Скопіюй відповідь клієнту — вставте на платформі\n"
+            "2. Отримай файл — скинь клієнту\n"
+            "3. Гроші на баланс\n\n"
+            "/scan — шукати зараз\n"
+            "/status — статистика\n"
+            "/pause — зупинити\n"
+            "/resume — відновити"
         )
 
     async def scan(self, u: Update, _):
-        if not self._ok(u): return
-        msg = await u.effective_message.reply_text("Сканую платформи... зачекай 1-2 хвилини")
-        jobs = await self.scanner.scan()
+        if not self._auth(u): return
+        msg = await u.effective_message.reply_text(
+            "Збираю завдання з платформ...\nЗачекай 1-3 хвилини"
+        )
+        raw = await self.scanner.scan()
         self.scans += 1
-        if not jobs:
+
+        if not raw:
             await msg.edit_text(
-                "Нових замовлень не знайдено.\n\n"
-                "Причина: всі знайдені вакансії вже були показані раніше.\n"
-                "Спробую знову через 15 хв — нові замовлення з'являться."
+                "Нових завдань не знайдено.\n"
+                "Всі вже були показані раніше.\n"
+                "Перевірю знову через 15 хв автоматично."
             )
             return
-        await msg.edit_text(f"Знайдено {len(jobs)}. Виконую через Claude...")
-        done = 0
-        for job in jobs[:5]:
-            job = self.executor.run(job)
-            _jobs[job.uid] = job
+
+        await msg.edit_text(
+            f"Знайдено {len(raw)} нових.\n"
+            f"Claude аналізує що може виконати..."
+        )
+
+        done = skip = 0
+        for task in raw[:10]:
+            result = self.executor.process(task)
+            if result is None:
+                skip += 1
+                continue
+            DB[result.uid] = result
             await u.effective_message.reply_text(
-                _card(job), reply_markup=_kb(job), disable_web_page_preview=True
+                card(result), reply_markup=kb(result),
+                disable_web_page_preview=True,
             )
             done += 1
             await asyncio.sleep(2)
-        await u.effective_message.reply_text(f"Готово! {done} замовлень надіслано.")
+
+        if done:
+            await u.effective_message.reply_text(
+                f"Готово: {done} завдань виконано і надіслано.\n"
+                f"Пропущено {skip} (вакансії або надто складні)."
+            )
+        else:
+            await u.effective_message.reply_text(
+                f"З {len(raw)} знайдених Claude пропустив всі.\n"
+                f"Всі виявились вакансіями або завданнями що потребують доступу до систем клієнта.\n"
+                f"Спробую через 15 хв."
+            )
 
     async def status(self, u: Update, _):
-        if not self._ok(u): return
-        await u.effective_message.reply_text(
+        if not self._auth(u): return
+        await self._send(u,
             f"Статус: {'ПАУЗА' if self.paused else 'АКТИВНИЙ'}\n"
             f"Сканів: {self.scans}\n"
-            f"Надіслано: {self.sent}\n"
-            f"В пам'яті: {len(_jobs)}\n"
-            f"Джерела: RemoteOK, WeWorkRemotely, Freelancer, Arbeitnow, Himalayas, FindWork\n"
-            f"Наступний скан: ~15 хв"
+            f"Надіслано завдань: {self.sent}\n"
+            f"Платформи: Freelancer, Guru, PeoplePerHour\n"
+            f"Логіка: Claude сам вирішує що виконувати"
         )
 
     async def pause(self, u: Update, _):
-        if not self._ok(u): return
+        if not self._auth(u): return
         self.paused = True
         await u.effective_message.reply_text("Зупинено. /resume щоб відновити.")
 
     async def resume(self, u: Update, _):
-        if not self._ok(u): return
+        if not self._auth(u): return
         self.paused = False
-        await u.effective_message.reply_text("Відновлено!")
-
-    async def text(self, u: Update, _):
-        if not self._ok(u): return
-        await u.effective_message.reply_text("Використовуй /scan або чекай — бот сам надішле замовлення.")
+        await u.effective_message.reply_text("Відновлено! Сканую кожні 15 хв.")
 
     async def callback(self, u: Update, _):
         q = u.callback_query
@@ -587,83 +495,74 @@ class Bot:
         if ":" not in q.data:
             return
         action, uid = q.data.split(":", 1)
-        j = _jobs.get(uid)
+        t = DB.get(uid)
 
-        if action == "skip":
+        if action == "s":
             await q.message.reply_text("Пропущено.")
             return
-        if not j:
+        if not t:
             await q.message.reply_text("Не знайдено. Запусти /scan знову.")
             return
 
-        if action == "reply":
+        if action == "r":
             await q.message.reply_text(
-                f"КОПІЮЙ І ВІДПРАВ КЛІЄНТУ:\n\n{j.reply_en}\n\n"
-                f"Відкрий замовлення: {j.url}",
+                f"КОПІЮЙ І ВІДПРАВ КЛІЄНТУ:\n\n{t.reply_en}\n\n"
+                f"Посилання: {t.url}",
                 disable_web_page_preview=True,
             )
 
-        elif action == "detail":
+        elif action == "d":
             await q.message.reply_text(
-                f"{j.title}\n\n{j.description[:800]}\n\n"
-                f"Бюджет: {j.budget}\n"
-                f"Пропонуй: ${j.price}\n"
-                f"Час: {j.minutes} хв\n"
-                f"Посилання: {j.url}",
+                f"Оригінал: {t.title}\n\n"
+                f"{t.desc[:800]}\n\n"
+                f"Бюджет: {t.budget}\n"
+                f"Пропонуй: ${t.price}\n"
+                f"Посилання: {t.url}",
                 disable_web_page_preview=True,
             )
 
-        elif action == "file":
-            if not j.result:
-                await q.message.reply_text("Виконую...")
-                j = self.executor.execute(j)
-                _jobs[uid] = j
+        elif action == "f":
+            if not t.result:
+                await q.message.reply_text("Виконую через Claude...")
+                t = self.executor.execute(t)
+                DB[uid] = t
+
             await q.message.reply_text(
-                f"ГОТОВИЙ РЕЗУЛЬТАТ — СКИНЬ КЛІЄНТУ\n\nВідкрий замовлення: {j.url}",
+                f"Готово — скинь клієнту на платформі:\n{t.url}",
                 disable_web_page_preview=True,
             )
-            if j._file_path and os.path.exists(j._file_path):
-                with open(j._file_path, "rb") as f:
+            if t.file_path and os.path.exists(t.file_path):
+                with open(t.file_path, "rb") as f:
                     await q.message.reply_document(
-                        document=InputFile(f, filename=j.filename),
-                        caption=f"{j.what} — готово до відправки",
+                        document=InputFile(f, filename=t.filename),
+                        caption=t.title_ua,
                     )
             else:
-                await q.message.reply_text(j.result[:4000])
-
-        elif action == "prompt":
-            prompt = (
-                f"Виконай це фріланс замовлення повністю і якісно.\n\n"
-                f"Назва: {j.title}\n\nОпис: {j.description}\n\n"
-                f"Зроби повний результат готовий до відправки клієнту без змін."
-            )
-            await q.message.reply_text(
-                f"ПРОМПТ — ВСТАВТЕ В claude.ai:\n\n{prompt}\n\n"
-                f"Посилання: {j.url}",
-                disable_web_page_preview=True,
-            )
+                for chunk in [t.result[i:i+4096] for i in range(0, len(t.result), 4096)]:
+                    await q.message.reply_text(chunk)
 
     async def _loop(self, app: Application):
-        await asyncio.sleep(15)
+        await asyncio.sleep(30)
         while True:
-            if not self.paused and ALLOWED_USER_ID:
+            if not self.paused and UID:
                 try:
-                    jobs = await self.scanner.scan()
+                    raw = await self.scanner.scan()
                     self.scans += 1
-                    for job in jobs[:5]:
-                        job = self.executor.run(job)
-                        await self._push(app, job)
-                        await asyncio.sleep(3)
+                    for task in raw[:8]:
+                        result = self.executor.process(task)
+                        if result:
+                            await self._push(app, result)
+                            await asyncio.sleep(3)
                 except Exception as e:
                     log.error(f"loop: {e}")
             await asyncio.sleep(900)
 
     def run(self):
-        if not TELEGRAM_BOT_TOKEN:
-            print("Встав TELEGRAM_BOT_TOKEN в Railway Variables!")
+        if not TOKEN or not API_KEY:
+            print("Встав TELEGRAM_BOT_TOKEN і ANTHROPIC_API_KEY в Railway Variables!")
             return
 
-        app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+        app = Application.builder().token(TOKEN).build()
         app.add_handler(CommandHandler("start",  self.start))
         app.add_handler(CommandHandler("help",   self.start))
         app.add_handler(CommandHandler("scan",   self.scan))
@@ -671,11 +570,17 @@ class Bot:
         app.add_handler(CommandHandler("pause",  self.pause))
         app.add_handler(CommandHandler("resume", self.resume))
         app.add_handler(CallbackQueryHandler(self.callback))
-        app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.text))
+        app.add_handler(MessageHandler(
+            filters.TEXT & ~filters.COMMAND,
+            lambda u, c: u.effective_message.reply_text(
+                "Чекай — бот сам надішле завдання кожні 15 хв.\n"
+                "Або /scan щоб перевірити зараз."
+            )
+        ))
 
         async def on_start(a):
             asyncio.create_task(self._loop(a))
-            log.info("Запущено! Сканую RemoteOK, WWR, Freelancer, Arbeitnow, Himalayas, FindWork")
+            log.info("v6 запущено!")
 
         app.post_init = on_start
         app.run_polling(drop_pending_updates=True)
