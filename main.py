@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 """
-FREELANCE HUNTER v6
-Claude сам вирішує що виконувати — без жорстких фільтрів.
-Скидає тільки те що може зробити за 1-2 промпти.
+FREELANCE HUNTER v7 — Professional AI Freelance Agency
+Знаходить завдання → виконує на рівні топ-фрілансера → готово до здачі
 """
 import asyncio, aiohttp, hashlib, re, logging, json, os
 from dataclasses import dataclass, field
@@ -26,15 +25,15 @@ def clean(text: str) -> str:
     text = re.sub(r'tag [A-Za-z0-9+/=]{10,}', '', text)
     text = re.sub(r'#[A-Za-z0-9]{15,}', '', text)
     text = re.sub(r'\s+', ' ', text)
-    return text.strip()[:700]
+    return text.strip()[:800]
 
 
-def get_budget(text: str) -> str:
-    for p in [r'\$[\d,]+\s*[-–]\s*\$[\d,]+', r'\$[\d,]+\+?', r'£[\d,]+', r'€[\d,]+']:
-        m = re.search(p, text, re.I)
-        if m:
-            return m.group(0).strip()
-    return "не вказано"
+def budget_str(bmin, bmax) -> str:
+    if bmin and bmax:
+        return f"${int(bmin)}–${int(bmax)}"
+    if bmin:
+        return f"${int(bmin)}+"
+    return "Not specified"
 
 
 @dataclass
@@ -43,18 +42,20 @@ class Task:
     desc: str
     url: str
     source: str
-    budget: str = "не вказано"
+    budget: str = "Not specified"
     uid: str = ""
-    # Після Claude аналізу
+    # Після аналізу
     title_ua: str = ""
     what_ua: str = ""
     how_ua: str = ""
-    time_ua: str = ""
-    price: int = 0
+    time_ua: str = "1-2 год"
+    price: int = 50
     reply_en: str = ""
+    delivery_type: str = "file"   # "file" або "prompt"
     result: str = ""
     filename: str = "result.txt"
     file_path: str = ""
+    prompt_for_user: str = ""
 
     def __post_init__(self):
         self.uid = hashlib.md5((self.url + self.title).encode()).hexdigest()[:10]
@@ -62,9 +63,8 @@ class Task:
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# СКАНЕР — збирає ВСЕ, Claude потім відбирає
+# СКАНЕР
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
 class Scanner:
     def __init__(self):
         self.seen: set = set()
@@ -90,15 +90,13 @@ class Scanner:
         return None
 
     async def _freelancer(self) -> list[Task]:
-        """Freelancer API — всі свіжі проекти без фільтрів"""
         queries = [
-            "chatgpt", "telegram bot", "python script",
-            "content writing", "blog article", "copywriting",
-            "web scraping", "data entry", "translation",
-            "resume", "proofreading", "ai assistant",
-            "automation", "google sheets", "email writing",
-            "social media", "product description", "chatbot",
-            "landing page", "html", "summarize", "research",
+            "chatgpt", "telegram bot", "python script", "content writing",
+            "blog article", "copywriting", "web scraping", "data entry",
+            "translation", "resume", "proofreading", "ai assistant",
+            "automation", "google sheets", "email writing", "social media",
+            "product description", "chatbot", "landing page", "research",
+            "rewriting", "ghostwriting", "summarize", "data analysis",
         ]
         tasks = []
         for q in queries:
@@ -114,30 +112,27 @@ class Scanner:
                     if not title or not pid:
                         continue
                     b = p.get("budget", {})
-                    bmin = int(b.get("minimum", 0) or 0)
-                    bmax = int(b.get("maximum", 0) or 0)
-                    bstr = f"${bmin}-${bmax}" if bmin else "не вказано"
                     tasks.append(Task(
                         title=title, desc=desc,
                         url=f"https://www.freelancer.com/projects/{pid}",
-                        source="Freelancer", budget=bstr,
+                        source="Freelancer",
+                        budget=budget_str(b.get("minimum"), b.get("maximum")),
                     ))
             await asyncio.sleep(1)
-        log.info(f"Freelancer: {len(tasks)} зібрано")
+        log.info(f"Freelancer: {len(tasks)}")
         return tasks
 
     async def _guru(self) -> list[Task]:
         import feedparser
         queries = [
-            "chatgpt", "telegram bot", "python script",
-            "content writing", "blog", "translation",
-            "resume", "data entry", "automation",
-            "copywriting", "web scraping", "ai",
+            "chatgpt", "telegram+bot", "python+script", "content+writing",
+            "blog+post", "translation", "resume", "data+entry",
+            "automation", "copywriting", "web+scraping", "ai+assistant",
         ]
         tasks = []
         for q in queries:
             text = await self._get(
-                f"https://www.guru.com/jobs/search/index.aspx?output=rss&keyword={q.replace(' ', '+')}",
+                f"https://www.guru.com/jobs/search/index.aspx?output=rss&keyword={q}",
                 as_text=True
             )
             if not text:
@@ -148,25 +143,23 @@ class Scanner:
                 url   = e.get("link", "")
                 if title and url:
                     tasks.append(Task(
-                        title=title, desc=desc, url=url,
-                        source="Guru",
-                        budget=get_budget(title + " " + desc),
+                        title=title, desc=desc,
+                        url=url, source="Guru",
                     ))
             await asyncio.sleep(0.8)
-        log.info(f"Guru: {len(tasks)} зібрано")
+        log.info(f"Guru: {len(tasks)}")
         return tasks
 
     async def _pph(self) -> list[Task]:
         import feedparser
         queries = [
-            "chatgpt", "telegram bot", "python",
-            "content writing", "blog", "translation",
-            "resume", "copywriting", "automation",
+            "chatgpt", "telegram+bot", "python", "content+writing",
+            "blog", "translation", "resume", "copywriting", "automation",
         ]
         tasks = []
         for q in queries:
             text = await self._get(
-                f"https://www.peopleperhour.com/rss/jobs?q={q.replace(' ', '+')}",
+                f"https://www.peopleperhour.com/rss/jobs?q={q}",
                 as_text=True
             )
             if not text:
@@ -177,12 +170,11 @@ class Scanner:
                 url   = e.get("link", "")
                 if title and url:
                     tasks.append(Task(
-                        title=title, desc=desc, url=url,
-                        source="PeoplePerHour",
-                        budget=get_budget(title + " " + desc),
+                        title=title, desc=desc,
+                        url=url, source="PeoplePerHour",
                     ))
             await asyncio.sleep(0.8)
-        log.info(f"PeoplePerHour: {len(tasks)} зібрано")
+        log.info(f"PeoplePerHour: {len(tasks)}")
         return tasks
 
     async def scan(self) -> list[Task]:
@@ -194,82 +186,113 @@ class Scanner:
         for r in results:
             if isinstance(r, list):
                 all_tasks.extend(r)
-
-        # Тільки нові (не показані раніше)
         new = [t for t in all_tasks if t.uid not in self.seen]
         for t in new:
             self.seen.add(t.uid)
-        log.info(f"Нових: {len(new)} з {len(all_tasks)}")
+        log.info(f"Нових: {len(new)}")
         return new
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# CLAUDE — аналізує і вирішує сам
+# CLAUDE — СУДДЯ + ВИКОНАВЕЦЬ
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-JUDGE_PROMPT = """Ти AI фріланс агент. Проаналізуй це завдання з фріланс платформи.
+JUDGE = """You are a senior AI freelance agency manager. Analyze this freelance task.
 
-ЗАВДАННЯ:
-Назва: {title}
-Опис: {desc}
-Бюджет: {budget}
-Платформа: {source}
+TASK:
+Title: {title}
+Description: {desc}
+Budget: {budget}
+Platform: {source}
 
-ТВОЄ ЗАВДАННЯ — вирішити чи можна виконати це за 1-2 промпти в Claude AI.
+Decide if this can be completed with Claude AI in 1-3 prompts WITHOUT access to client's private systems.
 
-Приклади що МОЖНА виконати:
-- Написати статтю/пост/опис
-- Зробити переклад тексту
-- Написати резюме або cover letter
-- Написати Python скрипт для автоматизації
-- Зробити Telegram/Discord бота
-- Зробити веб-скрапер
-- Переписати/відредагувати текст
-- Зробити email послідовність
-- Написати контент для соцмереж
-- Зробити просту HTML сторінку
-- Проаналізувати дані і написати звіт
+ACCEPT (can_do=true):
+- Writing: articles, blog posts, product descriptions, emails, social media, newsletters
+- Documents: resumes, cover letters, business proposals, reports, grant proposals
+- Code: Python scripts, automation, Telegram/Discord bots, web scrapers, Google Sheets scripts
+- Translation, proofreading, rewriting, editing
+- Research reports, data analysis (based on public info)
+- Simple HTML/CSS landing pages
+- Prompt engineering, ChatGPT workflows
+- ANY creative or text-based deliverable
 
-Приклади що НЕ МОЖНА (вакансія або занадто складне):
-- Повноцінна робота на ставці (salary, full-time, senior position)
-- Мобільний додаток з нуля
-- Складна ML модель
-- Дизайн логотипу/бренду
-- Відеомонтаж
+REJECT (can_do=false):
+- Full-time job position (mentions salary, benefits, years of experience required)
+- Needs client's private database/API/account access to function
+- Mobile app from scratch (iOS/Android)
+- Complex ML model training
+- Video/audio editing
+- Logo/brand graphic design
 
-Відповідай ТІЛЬКИ JSON без markdown:
+DELIVERY TYPE:
+- "file" = Claude delivers the complete result directly (text, code, documents)
+- "prompt" = task needs 2-3 steps with user input, provide detailed prompt guide
+
+Reply ONLY with valid JSON, no markdown:
 {{
-  "can_do": true або false,
-  "reason": "чому можна або не можна (1 речення)",
-  "title_ua": "Назва завдання українською",
-  "what_ua": "Що конкретно зробимо (1 речення)",
-  "how_ua": "Як виконаємо через Claude (1 речення)",
-  "time_ua": "30 хв або 1 год або 2 год",
-  "price": 50,
-  "reply_en": "Готова відповідь клієнту англійською. 2-3 речення. Природньо. Назви ціну і термін.",
-  "filename": "result.txt або result.py або result.md"
+  "can_do": true,
+  "title_ua": "Short task name in Ukrainian",
+  "what_ua": "What exactly needs to be done (1 sentence in Ukrainian)",
+  "how_ua": "How Claude will do it (1 sentence in Ukrainian)",
+  "time_ua": "30 min / 1 hour / 2 hours",
+  "price": 75,
+  "delivery_type": "file",
+  "filename": "result.py",
+  "reply_en": "Professional bid reply to client. 3-4 sentences. Confident, specific, mention relevant experience and exact deliverable. Include timeline and invite them to discuss details.",
+  "reject_reason": ""
 }}"""
 
-EXECUTE_PROMPT = """Ти топовий AI фріланс виконавець. Виконай завдання ПОВНІСТЮ і якісно.
 
-НАЗВА: {title}
-ДЕТАЛІ: {desc}
+EXECUTE = """You are an elite AI freelance specialist. Execute this task at the highest professional level.
 
-ПРАВИЛА:
-- Виконай повністю — клієнт отримає готовий результат
-- Якщо код — повний робочий код з коментарями
-- Якщо текст — повний готовий текст
-- Якщо переклад — повний переклад
-- Якщо бракує деталей — прийми найкраще рішення самостійно
-- НЕ пиши "зверніться до мене" або "уточніть деталі"
-- Результат має бути готовий до відправки БЕЗ змін"""
+CLIENT'S TASK:
+Title: {title}
+Full Description: {desc}
+Platform: {source}
+
+EXECUTION STANDARDS:
+1. Deliver a COMPLETE, READY-TO-USE result — not a template, not a draft
+2. Match the language of the task title/description exactly
+3. No placeholders like [INSERT HERE] or [YOUR NAME] — make intelligent assumptions
+4. Professional quality that exceeds client expectations
+5. If it's code: fully working, commented, with usage instructions
+6. If it's text: publication-ready, proper formatting for the platform
+7. If it's a document: complete, professional structure, real content
+8. Add value beyond what was asked — include extras the client will appreciate
+
+DO NOT:
+- Ask for clarification
+- Leave blank sections
+- Use asterisks for bold (**text**) — use plain text formatting
+- Write meta-commentary about your process
+- Include instructions to the user in the deliverable itself
+
+Deliver the final result now:"""
+
+
+PROMPT_GUIDE = """You are an elite AI freelance specialist. This task requires multiple steps with client input.
+
+TASK:
+Title: {title}
+Description: {desc}
+
+Create a complete PROMPT GUIDE that the freelancer can use to execute this step by step.
+
+Format it as a clear numbered guide in the task's language:
+1. What to ask the client first (if needed)
+2. Step-by-step Claude prompts to complete the work
+3. How to review and deliver the final result
+
+Make it so detailed that anyone can follow it and deliver professional results.
+Write in the same language as the task."""
 
 
 class Executor:
     def __init__(self):
         self.claude = anthropic.Anthropic(api_key=API_KEY)
 
-    def _ask(self, prompt: str, max_tokens=3000) -> str:
+    def _ask(self, prompt: str, max_tokens=4000) -> str:
         try:
             r = self.claude.messages.create(
                 model="claude-opus-4-5",
@@ -282,11 +305,10 @@ class Executor:
             return ""
 
     def judge(self, task: Task) -> Optional[Task]:
-        """Claude сам вирішує чи виконувати"""
         raw = self._ask(
-            JUDGE_PROMPT.format(
+            JUDGE.format(
                 title=task.title,
-                desc=task.desc[:500],
+                desc=task.desc[:600],
                 budget=task.budget,
                 source=task.source,
             ),
@@ -297,39 +319,53 @@ class Executor:
             if not m:
                 return None
             d = json.loads(m.group(0))
-
             if not d.get("can_do", False):
-                log.info(f"SKIP: {task.title[:50]} | {d.get('reason', '')}")
+                log.info(f"SKIP: {task.title[:60]} — {d.get('reject_reason', '')}")
                 return None
-
-            task.title_ua = d.get("title_ua", task.title[:60])
-            task.what_ua  = d.get("what_ua", "")
-            task.how_ua   = d.get("how_ua", "")
-            task.time_ua  = d.get("time_ua", "1-2 год")
-            task.price    = int(d.get("price", 50))
-            task.reply_en = d.get("reply_en", "Hi! I can help with this.")
-            task.filename = d.get("filename", "result.txt")
-            log.info(f"OK: {task.title_ua}")
+            task.title_ua      = d.get("title_ua", task.title[:60])
+            task.what_ua       = d.get("what_ua", "")
+            task.how_ua        = d.get("how_ua", "")
+            task.time_ua       = d.get("time_ua", "1-2 год")
+            task.price         = int(d.get("price", 60))
+            task.delivery_type = d.get("delivery_type", "file")
+            task.filename      = d.get("filename", "result.txt")
+            task.reply_en      = d.get("reply_en", "")
+            log.info(f"ACCEPT [{task.delivery_type}]: {task.title_ua}")
             return task
         except Exception as e:
-            log.error(f"judge parse: {e}")
+            log.error(f"judge: {e} | raw: {raw[:200]}")
             return None
 
     def execute(self, task: Task) -> Task:
-        """Claude виконує завдання"""
-        result = self._ask(
-            EXECUTE_PROMPT.format(title=task.title, desc=task.desc),
-            max_tokens=3000,
-        )
-        task.result = result
+        if task.delivery_type == "prompt":
+            # Для складніших завдань — детальний гайд з промптами
+            result = self._ask(
+                PROMPT_GUIDE.format(title=task.title, desc=task.desc),
+                max_tokens=2000,
+            )
+            task.prompt_for_user = result
+            task.result = result
+        else:
+            # Виконуємо повністю
+            result = self._ask(
+                EXECUTE.format(
+                    title=task.title,
+                    desc=task.desc,
+                    source=task.source,
+                ),
+                max_tokens=4000,
+            )
+            task.result = result
+
+        # Зберігаємо файл
         safe = re.sub(r'[^\w\-.]', '_', task.filename)
         path = f"/tmp/{task.uid}_{safe}"
         try:
             with open(path, "w", encoding="utf-8") as f:
-                f.write(result)
+                f.write(task.result)
             task.file_path = path
         except Exception as e:
-            log.error(f"save file: {e}")
+            log.error(f"save: {e}")
         return task
 
     def process(self, task: Task) -> Optional[Task]:
@@ -347,30 +383,32 @@ DB: dict[str, Task] = {}
 
 
 def card(t: Task) -> str:
+    icon = "Файл готовий" if t.delivery_type == "file" else "Покроковий промпт"
     return (
         f"НОВЕ ЗАВДАННЯ — {t.source}\n\n"
         f"{t.title_ua}\n\n"
         f"Що: {t.what_ua}\n"
         f"Як: {t.how_ua}\n\n"
-        f"Час: {t.time_ua}\n"
-        f"Бюджет: {t.budget}\n"
+        f"Час виконання: {t.time_ua}\n"
+        f"Бюджет клієнта: {t.budget}\n"
         f"Запропонуй: ${t.price}\n\n"
-        f"Файл готовий нижче"
+        f"Результат: {icon}"
     )
 
 
 def kb(t: Task) -> InlineKeyboardMarkup:
+    file_btn = "Отримати файл" if t.delivery_type == "file" else "Отримати промпт"
     return InlineKeyboardMarkup([
         [
             InlineKeyboardButton("Відповідь клієнту", callback_data=f"r:{t.uid}"),
-            InlineKeyboardButton("Деталі",            callback_data=f"d:{t.uid}"),
+            InlineKeyboardButton("Деталі завдання",   callback_data=f"d:{t.uid}"),
         ],
         [
-            InlineKeyboardButton("Отримати файл",     callback_data=f"f:{t.uid}"),
+            InlineKeyboardButton(file_btn, callback_data=f"f:{t.uid}"),
         ],
         [
-            InlineKeyboardButton("Відкрити",          url=t.url),
-            InlineKeyboardButton("Пропустити",        callback_data=f"s:{t.uid}"),
+            InlineKeyboardButton("Відкрити на платформі", url=t.url),
+            InlineKeyboardButton("Пропустити",            callback_data=f"s:{t.uid}"),
         ],
     ])
 
@@ -393,11 +431,34 @@ class Bot:
         for chunk in [text[i:i+4096] for i in range(0, len(text), 4096)]:
             await u.effective_message.reply_text(chunk, **kw)
 
+    async def _send_result(self, message, task: Task, caption_prefix=""):
+        """Надсилає результат — файлом якщо можливо, інакше текстом"""
+        if task.file_path and os.path.exists(task.file_path):
+            label = "ГОТОВИЙ ФАЙЛ" if task.delivery_type == "file" else "ПОКРОКОВИЙ ПРОМПТ"
+            await message.reply_text(
+                f"{label}\n\n"
+                f"Скинь цей файл клієнту на платформі.\n"
+                f"Посилання: {task.url}",
+                disable_web_page_preview=True,
+            )
+            with open(task.file_path, "rb") as f:
+                await message.reply_document(
+                    document=InputFile(f, filename=task.filename),
+                    caption=f"{task.title_ua} — готово до здачі",
+                )
+        else:
+            # Якщо файл не зберігся — надсилаємо текстом
+            chunks = [task.result[i:i+4096] for i in range(0, len(task.result), 4096)]
+            for i, chunk in enumerate(chunks):
+                prefix = "РЕЗУЛЬТАТ:\n\n" if i == 0 else ""
+                await message.reply_text(prefix + chunk, disable_web_page_preview=True)
+
     async def _push(self, app: Application, t: Task):
         DB[t.uid] = t
         try:
             await app.bot.send_message(
-                chat_id=UID, text=card(t),
+                chat_id=UID,
+                text=card(t),
                 reply_markup=kb(t),
                 disable_web_page_preview=True,
             )
@@ -405,17 +466,20 @@ class Bot:
         except Exception as e:
             log.error(f"push: {e}")
 
+    # ── КОМАНДИ ──────────────────────────────────────────────
+
     async def start(self, u: Update, _):
         if not self._auth(u): return
         await self._send(u,
-            "FREELANCE HUNTER v6\n\n"
-            "Збираю ВСІ завдання з Freelancer, Guru, PeoplePerHour.\n"
-            "Claude сам вирішує що може виконати за 1-2 промпти.\n"
-            "Виконує і надсилає готовий файл.\n\n"
+            "FREELANCE HUNTER v7\n\n"
+            "Сканую Freelancer, Guru, PeoplePerHour кожні 15 хв.\n"
+            "Claude вирішує що виконувати і виконує на рівні топ-фрілансера.\n\n"
+            "Прості завдання: отримуєш готовий файл.\n"
+            "Складніші: отримуєш покроковий промпт-гайд.\n\n"
             "Твоя участь:\n"
-            "1. Скопіюй відповідь клієнту — вставте на платформі\n"
-            "2. Отримай файл — скинь клієнту\n"
-            "3. Гроші на баланс\n\n"
+            "1. Скопіюй відповідь клієнту і відправ на платформі\n"
+            "2. Скинь готовий файл клієнту\n"
+            "3. Отримай гроші\n\n"
             "/scan — шукати зараз\n"
             "/status — статистика\n"
             "/pause — зупинити\n"
@@ -433,25 +497,25 @@ class Bot:
         if not raw:
             await msg.edit_text(
                 "Нових завдань не знайдено.\n"
-                "Всі вже були показані раніше.\n"
-                "Перевірю знову через 15 хв автоматично."
+                "Всі вже були показані. Перевірю знову через 15 хв."
             )
             return
 
         await msg.edit_text(
             f"Знайдено {len(raw)} нових.\n"
-            f"Claude аналізує що може виконати..."
+            f"Claude аналізує і виконує — це займе кілька хвилин..."
         )
 
         done = skip = 0
-        for task in raw[:10]:
+        for task in raw[:8]:
             result = self.executor.process(task)
             if result is None:
                 skip += 1
                 continue
             DB[result.uid] = result
             await u.effective_message.reply_text(
-                card(result), reply_markup=kb(result),
+                card(result),
+                reply_markup=kb(result),
                 disable_web_page_preview=True,
             )
             done += 1
@@ -459,14 +523,13 @@ class Bot:
 
         if done:
             await u.effective_message.reply_text(
-                f"Готово: {done} завдань виконано і надіслано.\n"
-                f"Пропущено {skip} (вакансії або надто складні)."
+                f"Готово: {done} завдань виконано.\n"
+                f"Пропущено: {skip} (вакансії або потребують доступу до систем клієнта)."
             )
         else:
             await u.effective_message.reply_text(
-                f"З {len(raw)} знайдених Claude пропустив всі.\n"
-                f"Всі виявились вакансіями або завданнями що потребують доступу до систем клієнта.\n"
-                f"Спробую через 15 хв."
+                "Всі знайдені завдання не підходять.\n"
+                "Спробую знову через 15 хв."
             )
 
     async def status(self, u: Update, _):
@@ -474,9 +537,9 @@ class Bot:
         await self._send(u,
             f"Статус: {'ПАУЗА' if self.paused else 'АКТИВНИЙ'}\n"
             f"Сканів: {self.scans}\n"
-            f"Надіслано завдань: {self.sent}\n"
+            f"Надіслано: {self.sent}\n"
             f"Платформи: Freelancer, Guru, PeoplePerHour\n"
-            f"Логіка: Claude сам вирішує що виконувати"
+            f"Версія: v7 Professional"
         )
 
     async def pause(self, u: Update, _):
@@ -487,7 +550,9 @@ class Bot:
     async def resume(self, u: Update, _):
         if not self._auth(u): return
         self.paused = False
-        await u.effective_message.reply_text("Відновлено! Сканую кожні 15 хв.")
+        await u.effective_message.reply_text("Відновлено!")
+
+    # ── КНОПКИ ───────────────────────────────────────────────
 
     async def callback(self, u: Update, _):
         q = u.callback_query
@@ -504,42 +569,35 @@ class Bot:
             await q.message.reply_text("Не знайдено. Запусти /scan знову.")
             return
 
+        # Відповідь клієнту
         if action == "r":
             await q.message.reply_text(
-                f"КОПІЮЙ І ВІДПРАВ КЛІЄНТУ:\n\n{t.reply_en}\n\n"
+                f"КОПІЮЙ І ВІДПРАВ КЛІЄНТУ НА ПЛАТФОРМІ:\n\n"
+                f"{t.reply_en}\n\n"
                 f"Посилання: {t.url}",
                 disable_web_page_preview=True,
             )
 
+        # Деталі
         elif action == "d":
             await q.message.reply_text(
-                f"Оригінал: {t.title}\n\n"
-                f"{t.desc[:800]}\n\n"
+                f"Оригінальна назва: {t.title}\n\n"
+                f"{t.desc[:1000]}\n\n"
                 f"Бюджет: {t.budget}\n"
                 f"Пропонуй: ${t.price}\n"
                 f"Посилання: {t.url}",
                 disable_web_page_preview=True,
             )
 
+        # Файл або промпт
         elif action == "f":
             if not t.result:
                 await q.message.reply_text("Виконую через Claude...")
                 t = self.executor.execute(t)
                 DB[uid] = t
+            await self._send_result(q.message, t)
 
-            await q.message.reply_text(
-                f"Готово — скинь клієнту на платформі:\n{t.url}",
-                disable_web_page_preview=True,
-            )
-            if t.file_path and os.path.exists(t.file_path):
-                with open(t.file_path, "rb") as f:
-                    await q.message.reply_document(
-                        document=InputFile(f, filename=t.filename),
-                        caption=t.title_ua,
-                    )
-            else:
-                for chunk in [t.result[i:i+4096] for i in range(0, len(t.result), 4096)]:
-                    await q.message.reply_text(chunk)
+    # ── ФОНОВИЙ ЦИКЛ ─────────────────────────────────────────
 
     async def _loop(self, app: Application):
         await asyncio.sleep(30)
@@ -548,7 +606,7 @@ class Bot:
                 try:
                     raw = await self.scanner.scan()
                     self.scans += 1
-                    for task in raw[:8]:
+                    for task in raw[:6]:
                         result = self.executor.process(task)
                         if result:
                             await self._push(app, result)
@@ -561,7 +619,6 @@ class Bot:
         if not TOKEN or not API_KEY:
             print("Встав TELEGRAM_BOT_TOKEN і ANTHROPIC_API_KEY в Railway Variables!")
             return
-
         app = Application.builder().token(TOKEN).build()
         app.add_handler(CommandHandler("start",  self.start))
         app.add_handler(CommandHandler("help",   self.start))
@@ -577,11 +634,9 @@ class Bot:
                 "Або /scan щоб перевірити зараз."
             )
         ))
-
         async def on_start(a):
             asyncio.create_task(self._loop(a))
-            log.info("v6 запущено!")
-
+            log.info("v7 Professional запущено!")
         app.post_init = on_start
         app.run_polling(drop_pending_updates=True)
 
