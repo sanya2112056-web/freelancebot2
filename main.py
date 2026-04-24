@@ -277,7 +277,6 @@ def _card(j: Job) -> str:
     d = "✅ Бот виконає САМ" if j.can_auto else "👆 Потрібна твоя участь"
     return (
         f"🎯 *НОВЕ ЗАМОВЛЕННЯ*\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
         f"{j.source_emoji} *{j.source}*\n\n"
         f"📋 *{j.title[:80]}*\n\n"
         f"💡 *Що:* {j.what}\n"
@@ -287,7 +286,6 @@ def _card(j: Job) -> str:
         f"💰 Бюджет: *{j.budget}*\n"
         f"💵 Твоя ціна: *${j.price}*\n\n"
         f"📦 {d}\n"
-        f"━━━━━━━━━━━━━━━━━━━━"
     )
 
 def _kb(j: Job) -> InlineKeyboardMarkup:
@@ -343,7 +341,6 @@ class Bot:
         if not self._ok(u): return
         await self._send(u, (
             "🎯 *FREELANCE HUNTER*\n"
-            "━━━━━━━━━━━━━━━━━━━━\n\n"
             "*Що робить бот:*\n"
             "• Кожні 15 хв сканує Upwork, Freelancer, Guru\n"
             "• Фільтрує тільки AI-виконувані замовлення\n"
@@ -390,7 +387,6 @@ class Bot:
         st = "⏸ ПАУЗА" if self.paused else "🟢 АКТИВНИЙ"
         await self._send(u, (
             f"📊 *Статус*\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n"
             f"Стан: *{st}*\n"
             f"🔍 Сканів: *{self.scans}*\n"
             f"📨 Надіслано: *{self.sent}*\n"
