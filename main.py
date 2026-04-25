@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-FREELANCE HUNTER v9 — фінальна робоча версія
-Знаходить замовлення → дає готовий промпт для claude.ai
+FREELANCE HUNTER v9 — Upwork only
+Знаходить замовлення на Upwork → дає готовий промпт для claude.ai
 """
 import asyncio, aiohttp, hashlib, re, logging, json, os
 from dataclasses import dataclass
@@ -35,7 +35,6 @@ class Task:
     source: str
     budget: str = "Not specified"
     uid: str = ""
-    # Після аналізу
     title_ua: str = ""
     what_ua: str = ""
     time_ua: str = "1 год"
@@ -49,130 +48,114 @@ class Task:
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# СКАНЕР
+# СКАНЕР — тільки Upwork RSS
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+# Upwork RSS — ці фіди публічні і реально працюють
+UPWORK_FEEDS = [
+    "https://www.upwork.com/ab/feed/jobs/rss?q=chatgpt&sort=recency&paging=0%3B50",
+    "https://www.upwork.com/ab/feed/jobs/rss?q=telegram+bot&sort=recency&paging=0%3B50",
+    "https://www.upwork.com/ab/feed/jobs/rss?q=python+script&sort=recency&paging=0%3B50",
+    "https://www.upwork.com/ab/feed/jobs/rss?q=content+writing&sort=recency&paging=0%3B50",
+    "https://www.upwork.com/ab/feed/jobs/rss?q=copywriting&sort=recency&paging=0%3B50",
+    "https://www.upwork.com/ab/feed/jobs/rss?q=translation&sort=recency&paging=0%3B50",
+    "https://www.upwork.com/ab/feed/jobs/rss?q=web+scraping&sort=recency&paging=0%3B50",
+    "https://www.upwork.com/ab/feed/jobs/rss?q=data+entry&sort=recency&paging=0%3B50",
+    "https://www.upwork.com/ab/feed/jobs/rss?q=proofreading&sort=recency&paging=0%3B50",
+    "https://www.upwork.com/ab/feed/jobs/rss?q=resume+writing&sort=recency&paging=0%3B50",
+    "https://www.upwork.com/ab/feed/jobs/rss?q=social+media+content&sort=recency&paging=0%3B50",
+    "https://www.upwork.com/ab/feed/jobs/rss?q=blog+article&sort=recency&paging=0%3B50",
+    "https://www.upwork.com/ab/feed/jobs/rss?q=automation+script&sort=recency&paging=0%3B50",
+    "https://www.upwork.com/ab/feed/jobs/rss?q=ai+assistant&sort=recency&paging=0%3B50",
+    "https://www.upwork.com/ab/feed/jobs/rss?q=ghostwriting&sort=recency&paging=0%3B50",
+    "https://www.upwork.com/ab/feed/jobs/rss?q=email+writing&sort=recency&paging=0%3B50",
+    "https://www.upwork.com/ab/feed/jobs/rss?q=product+description&sort=recency&paging=0%3B50",
+    "https://www.upwork.com/ab/feed/jobs/rss?q=chatbot&sort=recency&paging=0%3B50",
+    "https://www.upwork.com/ab/feed/jobs/rss?q=rewriting+editing&sort=recency&paging=0%3B50",
+    "https://www.upwork.com/ab/feed/jobs/rss?q=google+sheets+script&sort=recency&paging=0%3B50",
+]
+
+
 class Scanner:
     def __init__(self):
         self.seen: set = set()
         self._sess = None
 
-    async def _get(self, url: str, as_text=False):
+    async def _get_text(self, url: str) -> Optional[str]:
         try:
             if not self._sess or self._sess.closed:
                 self._sess = aiohttp.ClientSession(headers={
-                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
-                    "Accept": "application/json, text/xml, */*",
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                    "Accept": "application/rss+xml, application/xml, text/xml, */*",
                 })
-            async with self._sess.get(url, timeout=aiohttp.ClientTimeout(total=15)) as r:
+            async with self._sess.get(url, timeout=aiohttp.ClientTimeout(total=20)) as r:
                 if r.status == 200:
-                    if as_text:
-                        return await r.text()
-                    try:
-                        return await r.json(content_type=None)
-                    except:
-                        return await r.text()
+                    return await r.text()
+                log.debug(f"HTTP {r.status}: {url[:60]}")
         except Exception as e:
-            log.debug(f"fetch: {e}")
+            log.debug(f"fetch error: {e}")
         return None
 
-    async def _freelancer(self) -> list[Task]:
-        queries = [
-            "chatgpt", "telegram bot", "python script",
-            "content writing", "blog article", "copywriting",
-            "web scraping", "data entry", "translation",
-            "resume writing", "proofreading", "ai assistant",
-            "automation", "google sheets", "email writing",
-            "social media", "product description", "chatbot",
-            "ghostwriting", "rewriting", "editing", "research",
-        ]
+    def _parse_budget(self, text: str) -> str:
+        for p in [
+            r'\$[\d,]+\s*[-–]\s*\$[\d,]+',
+            r'\$[\d,]+\+?',
+            r'Budget[:\s]+\$?[\d,]+',
+            r'Fixed[:\s]+\$?[\d,]+',
+            r'Hourly[:\s]+\$?[\d,.]+',
+        ]:
+            m = re.search(p, text, re.I)
+            if m:
+                return m.group(0).strip()
+        return "Not specified"
+
+    async def _upwork(self) -> list[Task]:
+        import feedparser
         tasks = []
-        for q in queries:
-            data = await self._get(
-                f"https://www.freelancer.com/api/projects/0.1/projects/active/"
-                f"?query={q.replace(' ', '+')}&limit=20&job_details=true"
-            )
-            if isinstance(data, dict):
-                for p in data.get("result", {}).get("projects", []):
-                    title = p.get("title", "").strip()
-                    desc  = p.get("preview_description", "").strip()
-                    pid   = p.get("id")
-                    if not title or not pid:
+
+        for feed_url in UPWORK_FEEDS:
+            text = await self._get_text(feed_url)
+            if not text:
+                await asyncio.sleep(1)
+                continue
+
+            try:
+                feed = feedparser.parse(text)
+                for entry in feed.entries[:50]:
+                    title = entry.get("title", "").strip()
+                    desc  = entry.get("summary", entry.get("description", "")).strip()
+                    url   = entry.get("link", "")
+
+                    if not title or not url:
                         continue
-                    b    = p.get("budget", {})
-                    bmin = int(b.get("minimum", 0) or 0)
-                    bmax = int(b.get("maximum", 0) or 0)
+
+                    # Витягуємо бюджет з опису
+                    budget = self._parse_budget(desc)
+
                     tasks.append(Task(
-                        title=title, desc=desc,
-                        url=f"https://www.freelancer.com/projects/{pid}",
-                        source="Freelancer",
-                        budget=f"${bmin}–${bmax}" if bmin else "Not specified",
+                        title=title,
+                        desc=desc,
+                        url=url,
+                        source="Upwork",
+                        budget=budget,
                     ))
-            await asyncio.sleep(1)
-        log.info(f"Freelancer: {len(tasks)}")
-        return tasks
+            except Exception as e:
+                log.debug(f"parse error: {e}")
 
-    async def _guru(self) -> list[Task]:
-        import feedparser
-        queries = [
-            "chatgpt", "telegram+bot", "python+script",
-            "content+writing", "blog", "translation",
-            "resume", "automation", "copywriting", "rewriting",
-        ]
-        tasks = []
-        for q in queries:
-            text = await self._get(
-                f"https://www.guru.com/jobs/search/index.aspx?output=rss&keyword={q}",
-                as_text=True
-            )
-            if not text:
-                continue
-            for e in feedparser.parse(text).entries[:10]:
-                title = e.get("title", "").strip()
-                desc  = e.get("summary", "").strip()
-                url   = e.get("link", "")
-                if title and url:
-                    tasks.append(Task(title=title, desc=desc, url=url, source="Guru"))
-            await asyncio.sleep(0.8)
-        log.info(f"Guru: {len(tasks)}")
-        return tasks
+            # Пауза між запитами щоб не отримати бан
+            await asyncio.sleep(2)
 
-    async def _pph(self) -> list[Task]:
-        import feedparser
-        queries = [
-            "chatgpt", "telegram+bot", "python",
-            "content+writing", "blog", "translation",
-            "resume", "copywriting", "automation",
-        ]
-        tasks = []
-        for q in queries:
-            text = await self._get(
-                f"https://www.peopleperhour.com/rss/jobs?q={q}",
-                as_text=True
-            )
-            if not text:
-                continue
-            for e in feedparser.parse(text).entries[:10]:
-                title = e.get("title", "").strip()
-                desc  = e.get("summary", "").strip()
-                url   = e.get("link", "")
-                if title and url:
-                    tasks.append(Task(title=title, desc=desc, url=url, source="PeoplePerHour"))
-            await asyncio.sleep(0.8)
-        log.info(f"PeoplePerHour: {len(tasks)}")
+        log.info(f"Upwork: {len(tasks)} зібрано")
         return tasks
 
     async def scan(self) -> list[Task]:
-        results = await asyncio.gather(
-            self._freelancer(), self._guru(), self._pph(),
-            return_exceptions=True
-        )
-        all_tasks = []
-        for r in results:
-            if isinstance(r, list):
-                all_tasks.extend(r)
+        all_tasks = await self._upwork()
+
+        # Тільки нові
         new = [t for t in all_tasks if t.uid not in self.seen]
         for t in new:
             self.seen.add(t.uid)
+
         log.info(f"Нових: {len(new)}")
         return new
 
@@ -181,13 +164,12 @@ class Scanner:
 # CLAUDE — суддя і генератор промптів
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-JUDGE = """You are a senior manager at an AI freelance agency. Analyze this freelance task.
+JUDGE = """You are a senior manager at an AI freelance agency. Analyze this Upwork job posting.
 
 TASK:
 Title: {title}
 Description: {desc}
 Budget: {budget}
-Platform: {source}
 
 ACCEPT (can_do=true) if Claude AI can complete it with one detailed prompt:
 - Any writing: articles, blogs, emails, social posts, product descriptions, scripts, newsletters
@@ -195,12 +177,13 @@ ACCEPT (can_do=true) if Claude AI can complete it with one detailed prompt:
 - Code: Python scripts, Telegram bots, web scrapers, Google Sheets automations, HTML pages
 - Translation, proofreading, editing, rewriting
 - Research summaries using public information
-- Creative writing, ghostwriting
+- Creative writing, ghostwriting, content strategy
 
 REJECT (can_do=false) if:
 - It's a job position (salary, benefits, full-time, years of experience, we are hiring)
-- Needs client's private systems or data to work
-- Graphic design, video editing, mobile app development
+- Needs client's private systems, database, or API keys to function
+- Graphic/logo design, video editing, mobile app development from scratch
+- Requires ongoing work over many weeks with client collaboration
 
 Reply ONLY with JSON, no markdown:
 {{
@@ -210,11 +193,11 @@ Reply ONLY with JSON, no markdown:
   "what_ua": "Що потрібно зробити (1 речення українською)",
   "time_ua": "30 хв / 1 год / 2 год",
   "price": 75,
-  "reply_en": "Professional bid to client. 3 sentences. Confident, specific about deliverable and timeline. Sound like an expert who has done this 100 times."
+  "reply_en": "Professional Upwork bid. 3 sentences. Confident, specific about deliverable and timeline. Sound like an expert who has done this 100 times. No generic phrases."
 }}"""
 
 
-PROMPT_GEN = """You are a senior AI freelance specialist. Create a perfect Claude prompt for this task.
+PROMPT_GEN = """You are a senior AI freelance specialist. Create a perfect Claude prompt for this Upwork task.
 
 TASK:
 Title: {title}
@@ -223,15 +206,15 @@ Description: {desc}
 Create a prompt that when pasted into Claude will produce a COMPLETE, PROFESSIONAL, ready-to-deliver result.
 
 The prompt must:
-1. Be written in the same language as the task
-2. Include all context from the task description
-3. Specify exact quality standards expected
-4. Ask Claude to deliver more than the minimum — exceed expectations
-5. Specify format, length, tone appropriate for the task
-6. Include instruction to NOT use asterisks for formatting
-7. Tell Claude the result will be sent directly to a paying client
+1. Be written in the SAME LANGUAGE as the task title and description
+2. Include ALL relevant context from the task description
+3. Specify exact quality standards — professional level, ready to submit to paying client
+4. Ask Claude to EXCEED expectations — deliver more value than minimum required
+5. Specify appropriate format, length, tone for the specific task type
+6. Instruct Claude to use plain text formatting only — no asterisks, no markdown symbols
+7. State clearly that the result goes directly to a paying client with no further editing
 
-Write ONLY the prompt itself. Nothing else. Start directly with the prompt text."""
+Write ONLY the prompt text. Nothing else. No intro, no explanation. Start with the actual prompt."""
 
 
 class Executor:
@@ -256,7 +239,6 @@ class Executor:
                 title=task.title,
                 desc=task.desc[:600],
                 budget=task.budget,
-                source=task.source,
             ),
             max_tokens=400,
         )
@@ -302,7 +284,7 @@ DB: dict[str, Task] = {}
 
 def card(t: Task) -> str:
     return (
-        f"НОВЕ ЗАМОВЛЕННЯ — {t.source}\n\n"
+        f"НОВЕ ЗАМОВЛЕННЯ — Upwork\n\n"
         f"{t.title_ua}\n\n"
         f"Що: {t.what_ua}\n\n"
         f"Час: {t.time_ua}\n"
@@ -321,8 +303,8 @@ def kb(t: Task) -> InlineKeyboardMarkup:
             InlineKeyboardButton("Промпт для claude.ai", callback_data=f"p:{t.uid}"),
         ],
         [
-            InlineKeyboardButton("Відкрити замовлення", url=t.url),
-            InlineKeyboardButton("Пропустити",          callback_data=f"s:{t.uid}"),
+            InlineKeyboardButton("Відкрити на Upwork", url=t.url),
+            InlineKeyboardButton("Пропустити",         callback_data=f"s:{t.uid}"),
         ],
     ])
 
@@ -353,28 +335,29 @@ class Bot:
     async def start(self, u: Update, _):
         if not self._auth(u): return
         await u.effective_message.reply_text(
-            "FREELANCE HUNTER v9\n\n"
-            "Сканую Freelancer, Guru, PeoplePerHour кожні 15 хв.\n\n"
+            "FREELANCE HUNTER — Upwork\n\n"
+            "Сканую Upwork кожні 15 хв по 20 категоріях.\n\n"
             "Як це працює:\n\n"
-            "1. Бот знаходить замовлення\n"
+            "1. Бот знаходить замовлення на Upwork\n"
             "2. Натискаєш Відповідь клієнту\n"
-            "   Копіюєш текст, відкриваєш замовлення, вставляєш\n"
+            "   Копіюєш, відкриваєш замовлення, вставляєш bid\n"
             "3. Клієнт погоджується\n"
             "4. Натискаєш Промпт для claude.ai\n"
             "   Копіюєш, відкриваєш claude.ai, вставляєш\n"
             "   Отримуєш готовий результат\n"
-            "5. Копіюєш результат, здаєш клієнту\n"
+            "5. Копіюєш результат, здаєш клієнту на Upwork\n"
             "6. Гроші на баланс\n\n"
             "/scan — шукати зараз\n"
             "/status — статистика\n"
-            "/pause — зупинити авто-режим\n"
+            "/pause — зупинити\n"
             "/resume — відновити"
         )
 
     async def scan(self, u: Update, _):
         if not self._auth(u): return
         msg = await u.effective_message.reply_text(
-            "Збираю завдання...\nЗачекай 2-3 хвилини"
+            "Сканую Upwork по 20 категоріях...\n"
+            "Зачекай 2-3 хвилини"
         )
         raw = await self.scanner.scan()
         self.scans += 1
@@ -382,13 +365,14 @@ class Bot:
         if not raw:
             await msg.edit_text(
                 "Нових замовлень не знайдено.\n"
-                "Всі вже були показані. Перевірю через 15 хв автоматично."
+                "Всі вже були показані або Upwork тимчасово обмежив запити.\n"
+                "Перевірю знову через 15 хв автоматично."
             )
             return
 
         await msg.edit_text(
             f"Знайдено {len(raw)} нових.\n"
-            f"Аналізую через Claude..."
+            f"Claude аналізує що підходить..."
         )
 
         done = skip = 0
@@ -409,11 +393,12 @@ class Bot:
         if done:
             await u.effective_message.reply_text(
                 f"Готово. {done} замовлень надіслано.\n"
-                f"Пропущено {skip} (вакансії або потребують доступу до систем клієнта)."
+                f"Пропущено {skip} (вакансії або потребують систем клієнта)."
             )
         else:
             await u.effective_message.reply_text(
-                "Підходящих замовлень не знайдено. Спробую через 15 хв."
+                f"З {len(raw)} знайдених жодне не підійшло.\n"
+                f"Спробую через 15 хв."
             )
 
     async def status(self, u: Update, _):
@@ -422,7 +407,7 @@ class Bot:
             f"Статус: {'ПАУЗА' if self.paused else 'АКТИВНИЙ'}\n"
             f"Сканів: {self.scans}\n"
             f"Надіслано замовлень: {self.sent}\n"
-            f"Платформи: Freelancer, Guru, PeoplePerHour"
+            f"Платформа: Upwork (20 категорій)"
         )
 
     async def pause(self, u: Update, _):
@@ -450,53 +435,47 @@ class Bot:
             await q.message.reply_text("Не знайдено. Запусти /scan знову.")
             return
 
-        # Відповідь клієнту
         if action == "r":
             await q.message.reply_text(
                 f"КРОК 1 — ВІДПОВІДЬ КЛІЄНТУ\n\n"
-                f"Скопіюй і відправ на платформі:\n\n"
+                f"Скопіюй і відправ як bid на Upwork:\n\n"
                 f"{t.reply_en}\n\n"
-                f"Потім: {t.url}",
+                f"Відкрити замовлення: {t.url}",
                 disable_web_page_preview=True,
             )
 
-        # Деталі
         elif action == "d":
             await q.message.reply_text(
                 f"Оригінал: {t.title}\n\n"
                 f"{t.desc[:1000]}\n\n"
                 f"Бюджет: {t.budget}\n"
-                f"Пропонуй: ${t.price}\n"
+                f"Запропонуй: ${t.price}\n"
                 f"Посилання: {t.url}",
                 disable_web_page_preview=True,
             )
 
-        # Промпт для claude.ai
         elif action == "p":
             if not t.prompt:
-                await q.message.reply_text("Генерую промпт...")
+                await q.message.reply_text("Генерую промпт через Claude...")
                 t.prompt = self.executor.make_prompt(t)
                 DB[uid] = t
 
             if not t.prompt:
-                await q.message.reply_text("Помилка. Спробуй ще раз.")
+                await q.message.reply_text("Помилка генерації. Спробуй ще раз.")
                 return
 
-            # Промпт надсилаємо частинами якщо великий
-            header = "КРОК 2 — ПРОМПТ ДЛЯ CLAUDE.AI\n\nСкопіюй весь текст нижче і вставте на claude.ai:\n\n"
+            header = (
+                "КРОК 2 — ПРОМПТ ДЛЯ CLAUDE.AI\n\n"
+                "1. Відкрий claude.ai\n"
+                "2. Скопіюй весь текст нижче\n"
+                "3. Вставте і натисни Enter\n"
+                "4. Скопіюй результат і здай клієнту\n\n"
+                "--- ПРОМПТ ---\n\n"
+            )
             full = header + t.prompt
-
-            # Розбиваємо на частини по 4000 символів
             chunks = [full[i:i+4000] for i in range(0, len(full), 4000)]
             for chunk in chunks:
                 await q.message.reply_text(chunk, disable_web_page_preview=True)
-
-            await q.message.reply_text(
-                "Отримаєш готовий результат.\n"
-                "Скопіюй його і здай клієнту через:\n"
-                f"{t.url}",
-                disable_web_page_preview=True,
-            )
 
     async def _loop(self, app):
         await asyncio.sleep(30)
@@ -536,7 +515,7 @@ class Bot:
 
         async def on_start(a):
             asyncio.create_task(self._loop(a))
-            log.info("v9 запущено!")
+            log.info("Upwork Hunter запущено!")
 
         app.post_init = on_start
         app.run_polling(drop_pending_updates=True)
